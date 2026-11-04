@@ -1,4 +1,3 @@
-# version: 2.0.0
 #
 # Mosyle.ps1 - Mosyle Manager NIM PowerShell connector.
 # Requires Windows PowerShell 5.1 or later.
