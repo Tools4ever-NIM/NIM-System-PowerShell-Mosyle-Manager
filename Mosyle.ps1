@@ -1,3 +1,4 @@
+# version: 2.0.0
 #
 # Mosyle.ps1 - Mosyle Manager NIM PowerShell connector.
 # Requires Windows PowerShell 5.1 or later.
@@ -9,6 +10,7 @@ $Log_MaskableKeys = @(
     'proxy_password',
     'pincode'
 )
+
 
 # Shared class snapshot, populated only after a complete successful import.
 $script:MosyleClassesCache = $null
@@ -478,7 +480,7 @@ function Idm-DeviceCustomAttributeValuesRead {
             $count++
         }
     }
-    Log info "Done [DeviceCustomAttributeValues]: $count rows retrieved"
+    Log verbose "Done [DeviceCustomAttributeValues]: $count rows retrieved"
 }
 
 
