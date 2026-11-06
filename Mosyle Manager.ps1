@@ -1,3 +1,4 @@
+# version: 2.0.0
 #
 # Mosyle.ps1 - Mosyle Manager NIM PowerShell connector.
 # Requires Windows PowerShell 5.1 or later.
@@ -22,7 +23,7 @@ $script:MosyleTables = @{
         Path = '/v2/listdevices'
         Collection = 'devices'
         Paged = $true
-        Columns = 'deviceudid,serial_number,device_name,os,osversion,userid,useremail,username,usertype,asset_tag,tags,location'
+        Columns = 'deviceudid,total_disk,os,serial_number,asset_tag,device_name,device_model,battery,osversion,date_info,available_disk,wifi_mac_address,last_ip_beat,last_lan_ip,bluetooth_mac_address,is_supervised,date_app_info,date_last_beat,date_last_push,status,isActivationLockEnabled,userid,useremail,username,usertype,tags,location'
         Settings = @('os','tags','osversions','serial_numbers')
     }
     Classes = @{
@@ -227,6 +228,21 @@ $script:MosyleActions = @{
     }
 }
 
+# NIM-facing names match read-table properties; keys below are Mosyle wire names.
+$script:MosyleActionInputNames = @{
+    UserCreate = @{ managed_appleid = 'managedappleid' }
+    UserUpdate = @{ managed_appleid = 'managedappleid' }
+    DeviceUpdate = @{ serialnumber = 'serial_number'; name = 'device_name'; lock = 'lockmessage' }
+    DeviceUnassign = @{ devices = 'deviceudid' }
+    DeviceUpdateLimboLocation = @{ devices = 'deviceudid' }
+    DeviceLock = @{ devices = 'deviceudid' }
+    DynamicDeviceGroupAdd = @{ idgroup = 'id'; add = 'deviceudid' }
+    DynamicDeviceGroupRemove = @{ idgroup = 'id'; remove = 'deviceudid' }
+    SharedDeviceGroupAdd = @{ add = 'deviceudid' }
+    SharedDeviceGroupRemove = @{ remove = 'deviceudid' }
+    CustomDeviceAttributeUpdate = @{ os = 'OS'; old_unique_id = 'UniqueID'; unique_id = 'NewUniqueID'; name = 'Name'; value = 'Value' }
+}
+
 #
 # System functions
 #
@@ -337,7 +353,7 @@ function Idm-SystemInfo {
     if ($TestConnection) {
         $settings = ConvertFrom-Json2 $ConnectionParams
         $token = Get-MosyleAuthorization $settings
-        $null = Get-MosyleUsersPage -Settings $settings -Authorization $token -Page 1 -Columns @('id','name','managedappleid','type','email')
+        $null = Get-MosyleUsersPage -Settings $settings -Authorization $token -Page 1 -Columns @('id','name','managedappleid','type','email','locations')
         Log info 'Connection test succeeded'
     }
 
@@ -365,7 +381,7 @@ function Idm-UsersRead {
             type = 'textbox'
             label = 'Specific columns'
             tooltip = 'Comma-separated Mosyle user column names. These columns also define the output schema.'
-            value = 'id,name,managedappleid,type,email'
+            value = 'id,name,managedappleid,type,email,locations'
         }
         Log verbose 'Done [Users metadata]'
         return
@@ -379,7 +395,7 @@ function Idm-UsersRead {
     }
     $columnText = [string] $table.specific_columns
     if ([string]::IsNullOrWhiteSpace($columnText)) {
-        $columnText = 'id,name,managedappleid,type,email'
+        $columnText = 'id,name,managedappleid,type,email,locations'
     }
     $columns = @($columnText -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)
     if ($columns.Count -eq 0) {
@@ -406,6 +422,9 @@ function Idm-UsersRead {
             $row = [ordered]@{}
             foreach ($column in $columns) {
                 $value = $user.$column
+                if ($column -eq 'locations' -and $value -is [string]) {
+                    $value = @($value)
+                }
                 if ($null -ne $value -and $value -isnot [string] -and $value -isnot [ValueType]) {
                     $value = ConvertTo-Json -InputObject $value -Depth 32 -Compress
                 }
@@ -446,11 +465,11 @@ function Idm-DeviceCustomAttributeValuesRead {
     )
 
     if ($GetMeta) {
-        Get-MosyleTableMetaData -Class 'Devices' | Where-Object { $_.name -ne 'specific_columns' }
+        @()
         return
     }
     Log verbose '-GetMeta=False [DeviceCustomAttributeValues]'
-    $devices = @(Get-MosyleDevices -SystemParams $SystemParams -FunctionParams $FunctionParams)
+    $devices = @(Get-MosyleDevices -SystemParams $SystemParams -UseExistingCache)
     $count = 0
     foreach ($device in $devices) {
         $attributes = $device.CustomDeviceAttributes
@@ -1077,13 +1096,24 @@ function ConvertTo-MosyleArray {
             }
         }
         elseif ($Objects) {
-            throw 'Locations must be a JSON array of objects with name and, for students, grade_level.'
+            # A single location name is one value, even if the name contains commas.
+            $Value = @($Value)
         }
         else { $Value = @($Value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
     }
     foreach ($item in @($Value)) {
         if ($null -ne $item) {
-            $item
+            if ($Objects -and $item -is [array]) {
+                ConvertTo-MosyleArray -Value $item -Objects
+            }
+            elseif ($Objects -and $item -is [string]) {
+                if (-not [string]::IsNullOrWhiteSpace($item)) {
+                    @{ name = $item }
+                }
+            }
+            else {
+                $item
+            }
         }
     }
 }
@@ -1121,6 +1151,17 @@ function Invoke-MosyleApi {
     if (-not $data.status -and $Path -ne '/v2/iossecuritycontrolscompliance') {
         throw "$($response.MosyleRequestContext) - No API status returned."
     }
+    # Mosyle uses this status for an empty device list, including OS types with no devices.
+    if (-not $Mutation -and $Path -eq '/v2/listdevices' -and $data.status -eq 'OK') {
+        $containers = @($data.response)
+        if ($containers.Count -eq 1 -and $containers[0].status -eq 'DEVICES_NOTFOUND') {
+            Log verbose "$($response.MosyleRequestContext) - No devices found"
+            $data.response = [PSCustomObject]@{
+                status = 'OK'
+                devices = @()
+            }
+        }
+    }
     foreach ($item in @($data.response) + @($data.elements)) {
         if ($null -eq $item) {
             continue
@@ -1147,6 +1188,10 @@ function Get-MosyleTableMetaData {
         if ($name -eq 'os') {
             $value = 'mac'
             $tooltip = 'Required OS: ios, mac, tvos, visionos (subject to endpoint support).'
+            if ($Class -eq 'Devices') {
+                $value = 'mac,ios,tvos,visionos'
+                $tooltip = 'Comma-separated OS types: mac, ios, tvos, visionos. Defaults to all four; each OS is paginated separately.'
+            }
         }
         if ($name -eq 'is_security_group') {
             $value = '0'
@@ -1234,7 +1279,7 @@ function Read-MosyleTable {
             if ($Class -eq 'SharedDeviceGroups') {
                 $allowed = @('ios','mac','visionos')
             }
-            if ($value -notin $allowed) {
+            if ($value -notin $allowed -and -not ($Class -eq 'Devices' -and -not $RawDeviceData)) {
                 throw "Unsupported os for $Class."
             }
         }
@@ -1463,7 +1508,7 @@ function Read-MosyleTable {
         # Classes have no documented total: continue until an empty page.
         $page++
     } while ($true)
-    Log info "Done [$Class]: $rowCount rows retrieved"
+    Log verbose "Done [$Class]: $rowCount rows retrieved"
 }
 
 function Invoke-MosyleAction {
@@ -1480,14 +1525,40 @@ function Invoke-MosyleAction {
         @{
             semantics = $definition.Semantics
             parameters = @(
-                foreach ($name in $definition.Required) { @{ name = $name; allowance = 'mandatory' } }
-                foreach ($name in $definition.Optional) { @{ name = $name; allowance = 'optional' } }
+                foreach ($name in $definition.Required) {
+                    $allowance = if ($Action -eq 'CustomDeviceAttributeUpdate' -and $name -eq 'unique_id') { 'optional' } else { 'mandatory' }
+                    @{ name = (Get-MosyleActionInputName -Action $Action -Name $name); allowance = $allowance }
+                }
+                foreach ($name in $definition.Optional) { @{ name = (Get-MosyleActionInputName -Action $Action -Name $name); allowance = 'optional' } }
+                # Hide properties that are not supported by this action from NIM mapping.
+                @{ name = '*'; allowance = 'prohibited' }
             )
         }
         return
     }
     $system_params = ConvertFrom-Json2 $SystemParams
     $function_params = ConvertFrom-Json2 $FunctionParams
+    # Normalize public names to wire names before existing validation and serialization.
+    foreach ($wireName in @($definition.Required) + @($definition.Optional)) {
+        $inputName = Get-MosyleActionInputName -Action $Action -Name $wireName
+        if ($inputName -eq $wireName -or -not $function_params.ContainsKey($inputName)) { continue }
+        if ($function_params.ContainsKey($wireName)) {
+            $canonical = ConvertTo-Json -InputObject $function_params[$inputName] -Depth 32 -Compress
+            $legacy = ConvertTo-Json -InputObject $function_params[$wireName] -Depth 32 -Compress
+            if ($canonical -cne $legacy) { throw "Conflicting values for '$inputName' and legacy parameter '$wireName'." }
+        }
+        $function_params[$wireName] = $function_params[$inputName]
+    }
+    if ($Action -eq 'CustomDeviceAttributeUpdate' -and -not $function_params.ContainsKey('unique_id') -and $function_params.ContainsKey('old_unique_id')) {
+        $function_params.unique_id = $function_params.old_unique_id
+    }
+    if ($Action -in @('UserCreate','UserUpdate') -and $function_params.ContainsKey('type')) {
+        $function_params.type = ([string]$function_params.type).ToUpperInvariant()
+        switch ([string]$function_params.type) {
+            'STUDENT' { $function_params.type = 'S' }
+            'TEACHER' { $function_params.type = 'T' }
+        }
+    }
     $element = @{}
     if ($definition.Operation) {
         $element.operation = $definition.Operation
@@ -1495,7 +1566,7 @@ function Invoke-MosyleAction {
     foreach ($name in @($definition.Required) + @($definition.Optional)) {
         if (-not $function_params.ContainsKey($name)) {
             if ($name -in $definition.Required) {
-                throw "Action parameter '$name' is required."
+                throw "Action parameter '$(Get-MosyleActionInputName -Action $Action -Name $name)' is required."
             }
             continue
         }
@@ -1503,11 +1574,11 @@ function Invoke-MosyleAction {
         if ($name -in $definition.Arrays) {
             $value = @(ConvertTo-MosyleArray -Value $value -Objects:($name -eq 'locations'))
             if ($value.Count -eq 0) {
-                throw "Action array '$name' cannot be empty."
+                throw "Action array '$(Get-MosyleActionInputName -Action $Action -Name $name)' cannot be empty."
             }
         }
         if ($name -in $definition.Required -and ($null -eq $value -or ($name -ne 'value' -and $value -is [string] -and [string]::IsNullOrWhiteSpace($value)))) {
-            throw "Action parameter '$name' cannot be empty."
+            throw "Action parameter '$(Get-MosyleActionInputName -Action $Action -Name $name)' cannot be empty."
         }
         $element[$name] = $value
     }
@@ -1566,7 +1637,7 @@ function Invoke-MosyleAction {
         if ($element.ContainsKey($name)) {
             $number = 0L
             if (-not [long]::TryParse([string]$element[$name], [ref]$number) -or $number -le 0) {
-                throw "Parameter '$name' must be a positive integer."
+                throw "Parameter '$(Get-MosyleActionInputName -Action $Action -Name $name)' must be a positive integer."
             }
             $element[$name] = $number
         }
@@ -1601,6 +1672,9 @@ function Invoke-MosyleAction {
             }
         }
     }
+    if ($Action -in @('DeviceUpdate','DeviceUnassign','DeviceUpdateLimboLocation','DeviceLock','UserAssignDevice')) {
+        $script:MosyleDevicesCache = $null
+    }
     Log info "Done [$Action]"
     $output = [ordered]@{}
     foreach ($key in $element.Keys | Sort-Object) {
@@ -1611,7 +1685,14 @@ function Invoke-MosyleAction {
         if ($value -is [array]) {
             $value = ConvertTo-Json -InputObject $value -Depth 32 -Compress
         }
-        $output[$key] = $value
+        if ($key -eq 'type' -and $Action -in @('UserCreate','UserUpdate')) {
+            if ($value -eq 'S') { $value = 'STUDENT' }
+            elseif ($value -eq 'T') { $value = 'TEACHER' }
+        }
+        $output[(Get-MosyleActionInputName -Action $Action -Name $key)] = $value
+    }
+    if ($Action -eq 'CustomDeviceAttributeUpdate') {
+        $output['UniqueID'] = $element.unique_id
     }
     [PSCustomObject]$output
 }
@@ -1664,29 +1745,87 @@ function Idm-OnUnload {
 function Get-MosyleDevices {
     param (
         [string] $SystemParams,
-        [string] $FunctionParams
+        [string] $FunctionParams,
+        [switch] $UseExistingCache
     )
+
+    # NIM may serialize identical connection settings in a different property order.
+    $settings = ConvertFrom-Json2 $SystemParams
+    $canonicalSettings = [ordered]@{}
+    foreach ($name in @($settings.Keys | Sort-Object)) { $canonicalSettings[$name] = $settings[$name] }
+    $connectionJson = ConvertTo-Json -InputObject $canonicalSettings -Depth 10 -Compress
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $connectionKey = [Convert]::ToBase64String($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($connectionJson))) }
+    finally { $hasher.Dispose() }
+    if ($UseExistingCache -and $null -ne $script:MosyleDevicesCache -and $script:MosyleDevicesCache.ConnectionKey -eq $connectionKey) {
+        Log verbose 'Using existing Devices cache for DeviceCustomAttributeValues'
+        $script:MosyleDevicesCache.Rows
+        return
+    }
 
     $parameters = @{}
     if (-not [string]::IsNullOrWhiteSpace($FunctionParams)) { $parameters = ConvertFrom-Json2 $FunctionParams }
     $filters = [ordered]@{}
     foreach ($name in @('os','tags','osversions','serial_numbers')) {
-        if ($parameters.ContainsKey($name)) { $filters[$name] = $parameters[$name] }
+        if ($name -ne 'os' -and $parameters.ContainsKey($name)) {
+            $values = @(ConvertTo-MosyleArray -Value $parameters[$name] | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Sort-Object -Unique)
+            if ($values.Count -gt 0) { $filters[$name] = $values }
+        }
     }
-    if (-not $filters.Contains('os') -or [string]::IsNullOrWhiteSpace([string]$filters.os)) { $filters.os = 'mac' }
+    $operatingSystems = @(Get-MosyleDeviceOperatingSystems -Value $parameters.os)
+    # A normalized order lets both device tables share the same cache regardless of input order.
+    $filters.os = $operatingSystems -join ','
     $filterJson = ConvertTo-Json -InputObject $filters -Depth 10 -Compress
     $hasher = [Security.Cryptography.SHA256]::Create()
     try {
-        $key = [Convert]::ToBase64String($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($SystemParams + '|' + $filterJson)))
+        $key = [Convert]::ToBase64String($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($connectionJson + '|' + $filterJson)))
     }
     finally { $hasher.Dispose() }
     if ($null -eq $script:MosyleDevicesCache -or $script:MosyleDevicesCache.Key -ne $key) {
         $script:MosyleDevicesCache = $null
         Log verbose 'Loading shared Devices cache'
         # Without specific_columns, Mosyle returns all device fields including custom attributes.
-        $rows = @(Read-MosyleTable -SystemParams $SystemParams -FunctionParams $filterJson -Class 'Devices' -RawDeviceData)
-        $script:MosyleDevicesCache = @{ Key = $key; Rows = $rows }
+        $rows = @(
+            foreach ($os in $operatingSystems) {
+                $osFilters = [ordered]@{}
+                foreach ($name in $filters.Keys) { $osFilters[$name] = $filters[$name] }
+                $osFilters.os = $os
+                $osFilterJson = ConvertTo-Json -InputObject $osFilters -Depth 10 -Compress
+                Read-MosyleTable -SystemParams $SystemParams -FunctionParams $osFilterJson -Class 'Devices' -RawDeviceData
+            }
+        )
+        $script:MosyleDevicesCache = @{ Key = $key; ConnectionKey = $connectionKey; Rows = $rows }
     }
     else { Log verbose 'Using shared Devices cache' }
     $script:MosyleDevicesCache.Rows
+}
+
+function Get-MosyleDeviceOperatingSystems {
+    param (
+        $Value
+    )
+
+    $allowed = @('mac','ios','tvos','visionos')
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $allowed
+    }
+    $selected = @(ConvertTo-MosyleArray -Value $Value | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Select-Object -Unique)
+    if ($selected.Count -eq 0) { throw 'Specify at least one device OS: mac, ios, tvos, visionos.' }
+    foreach ($os in $selected) {
+        if ($os -notin $allowed) { throw "Unsupported device OS '$os'. Supported values: mac, ios, tvos, visionos." }
+    }
+    foreach ($os in $allowed) {
+        if ($os -in $selected) { $os }
+    }
+}
+
+function Get-MosyleActionInputName {
+    param (
+        [string] $Action,
+        [string] $Name
+    )
+
+    $names = $script:MosyleActionInputNames[$Action]
+    if ($null -ne $names -and $names.ContainsKey($Name)) { return $names[$Name] }
+    return $Name
 }
