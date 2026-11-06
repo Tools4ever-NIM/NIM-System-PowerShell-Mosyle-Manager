@@ -1,6 +1,6 @@
 # Mosyle Manager
 
-Read the [Mosyle integration documentation](https://docs.nimsuite.com/en/integrations/mosyle) for connector details and related guides.
+Read the [Mosyle integration documentation](https://docs.nimsuite.com/en/integrations/mosyle-manager) for connector details and related guides.
 
 <img src="https://github.com/user-attachments/assets/fbe29735-5f30-433d-9f29-aa17e9206f8e" width="256px" />
 
